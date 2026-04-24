@@ -10,9 +10,10 @@ import requests
 import base64
 import json
 
-# --- パス解決 ---
+# --- 1. パス解決 (DFHC規約準拠) ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# --- 2. 追跡オブジェクト管理クラス ---
 class TrackedObject:
     def __init__(self, obj_id, center, area):
         self.obj_id = obj_id
@@ -20,6 +21,7 @@ class TrackedObject:
         self.area = area
         self.last_seen = time.time()
 
+# --- 3. メイン解析クラス ---
 class WWTP_Monitor:
     def __init__(self, params):
         self.params = params
@@ -29,25 +31,25 @@ class WWTP_Monitor:
         self.next_id = 0
         self.tracked_objects = []
         
-        # --- 【修正ポイント】GStreamerパイプライン（引数はこれ1つだけにします） ---
+        # 【重要】AIBox標準GStreamerパイプライン
+        # 引数エラー回避のため、この文字列1つだけをVideoCaptureに渡します
         gst_pipeline = (
             f"nvarguscamerasrc sensor-id={self.dev_id} ! "
             "video/x-raw(memory:NVMM), width=1920, height=1080, format=NV12, framerate=30/1 ! "
             "nvvidconv ! video/x-raw, format=BGRx ! "
-            "videoconvert ! video/x-raw, format=BGR ! appsink"
+            "videoconvert ! video/x-raw, format=BGR ! appsink drop=True"
         )
         
-        logging.info(f"Opening camera: sensor-id={self.dev_id}")
-        
-        # 第2引数を削除し、パイプライン文字列1つのみでオープン
+        logging.info(f"Opening camera via GStreamer: sensor-id={self.dev_id}")
         self.cap = cv2.VideoCapture(gst_pipeline)
 
-        # 背景差分
+        # 背景差分エンジンの初期化
         self.fgbg = cv2.createBackgroundSubtractorMOG2(
             history=params['history'], varThreshold=params['v_thresh'], detectShadows=True
         )
 
     def send_seeit_event(self, event_type, message, frame=None):
+        """クラウド(SeeIT)への通知処理"""
         payload = {
             "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S'),
             "event_type": event_type,
@@ -56,42 +58,55 @@ class WWTP_Monitor:
         }
         if frame is not None:
             try:
+                # 画質70%でJPEG圧縮して送信負荷を軽減
                 ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                 if ret:
                     payload["image_data"] = base64.b64encode(buffer).decode('utf-8')
                     payload["image_type"] = "image/jpeg"
-            except Exception: pass
+            except Exception as e:
+                logging.warning(f"Image encode error: {e}")
 
         try:
             requests.post(self.params['api_url'], json=payload, timeout=2.0)
-        except Exception: pass
+            logging.info(f"Notification sent: {message}")
+        except Exception:
+            pass # オフライン時などは無視
 
     def run(self):
+        """メインループ"""
         if not self.cap.isOpened():
-            logging.error("Failed to open camera. Check device_id in .conf file.")
+            logging.error("CRITICAL: Failed to open camera. Check hardware or sensor-id.")
             return
 
-        logging.info("Monitoring Started. Waiting for warm-up...")
+        logging.info("Monitoring logic started. Waiting for background warm-up...")
 
         while True:
             ret, frame = self.cap.read()
             if not ret:
+                logging.error("Failed to receive frame. Restarting nvargus-daemon might help.")
                 break
 
             self.frame_count += 1
             current_time = time.time()
             
+            # --- 動体検知処理 ---
             fgmask = self.fgbg.apply(frame)
+            
+            # ウォームアップ中は解析をスキップ（学習に専念）
             if self.frame_count <= self.params['warmup_frames']:
+                if self.frame_count % 20 == 0:
+                    logging.info(f"Warming up... ({self.frame_count}/{self.params['warmup_frames']})")
                 continue
 
+            # マスクのノイズ除去
             _, thresh = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2:]
 
             current_detections = []
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area < self.params['min_area']: continue
+                if area < self.params['min_area']:
+                    continue
                 
                 M = cv2.moments(contour)
                 if M['m00'] == 0: continue
@@ -99,7 +114,7 @@ class WWTP_Monitor:
                 x, y, w, h = cv2.boundingRect(contour)
                 current_detections.append({'center': (cx, cy), 'area': area, 'bbox': (x, y, w, h)})
 
-            # 追跡ロジック
+            # --- トラッキング処理 ---
             updated_objects = []
             for det in current_detections:
                 matched_obj = None
@@ -110,47 +125,62 @@ class WWTP_Monitor:
                         break
                 
                 if matched_obj:
+                    # 既存オブジェクトの更新
                     matched_obj.center, matched_obj.area, matched_obj.last_seen = det['center'], det['area'], current_time
                     updated_objects.append(matched_obj)
                 else:
+                    # 新規オブジェクトの検知・通知
                     new_obj = TrackedObject(self.next_id, det['center'], det['area'])
                     if current_time - self.last_send_time > self.params['send_interval']:
-                        self.send_seeit_event("DETECTION", f"ID:{new_obj.obj_id} detected", frame=frame)
+                        self.send_seeit_event("DETECTION", f"New Object ID:{new_obj.obj_id}", frame=frame)
                         self.last_send_time = current_time
                     self.next_id += 1
                     updated_objects.append(new_obj)
 
+                # 描画処理
                 x, y, w, h = det['bbox']
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID:{getattr(matched_obj or new_obj, 'obj_id')}", (x, y-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
+            # 一定時間見失ったオブジェクトを削除
             self.tracked_objects = [obj for obj in updated_objects if current_time - obj.last_seen < self.params['track_timeout']]
             
+            # --- 画面表示 ---
             cv2.imshow('AIBox Monitor', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            
+            # 'q'キーで終了
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
         self.cap.release()
         cv2.destroyAllWindows()
 
+# --- 4. 実行エントリーポイント ---
 if __name__ == "__main__":
+    # 設定ファイルの読み込み
     conf_path = os.path.abspath(os.path.join(CURRENT_DIR, '../conf/app/WWTP_Monitoring.conf'))
     config = configparser.ConfigParser()
     config.read(conf_path)
 
+    # ログ設定 (SDカード/拡張ストレージ領域)
     log_file = config.get('logging', 'log_file', fallback='/mnt/userstorage/log/WWTP_Monitoring.log')
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s',
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s',
                         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)])
 
+    # 解析パラメータの設定
     params = {
-        'dev_id': config.getint('camera', 'device_id', fallback=0), # 0か1を試してください
-        'min_area': 1000,
-        'warmup_frames': 60,
-        'v_thresh': 50,
-        'history': 500,
-        'track_timeout': 1.0,
-        'dist_threshold': 100,
+        'dev_id': config.getint('camera', 'device_id', fallback=0), # 通常は0か1
+        'min_area': 1000,           # 検知する最小サイズ（ピクセル）
+        'warmup_frames': 60,        # 背景学習フレーム数
+        'v_thresh': 40,             # 感度（低いほど敏感）
+        'history': 500,             # 背景の記憶の長さ
+        'track_timeout': 1.0,       # 何秒見失ったら追跡終了か
+        'dist_threshold': 100,      # 同一物体とみなす距離（ピクセル）
         'api_url': config.get('seeit', 'api_url', fallback='http://localhost:8080/api/event'),
-        'send_interval': 30
+        'send_interval': 30         # 通知の間隔（秒）
     }
 
+    # モニタリング開始
     WWTP_Monitor(params).run()
